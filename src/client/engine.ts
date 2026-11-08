@@ -13,11 +13,9 @@ type TTrackedStream = {
   el: HTMLAudioElement;
   kind: TSourceKind;
   id: string;
-  sourceNode?: MediaStreamAudioSourceNode;
-  gainNode?: GainNode;
-  currentGain: number;
   userVolume: number;
-  userMuted: boolean;
+  currentDuckedVolume: number;
+  animFrame?: number;
   cleanup?: () => void;
 };
 
@@ -153,10 +151,9 @@ export const createDuckEngine = () => {
       return;
     }
 
-    const audioCtx = getAudioContext();
-
     if (classification.kind === "voice") {
       try {
+        const audioCtx = getAudioContext();
         const sourceNode = audioCtx.createMediaStreamSource(stream);
         const analyser = audioCtx.createAnalyser();
         analyser.fftSize = 256;
@@ -179,79 +176,46 @@ export const createDuckEngine = () => {
     } else {
       // Stream / Screen share (music bot target)
       try {
-        const sourceNode = audioCtx.createMediaStreamSource(stream);
-        const gainNode = audioCtx.createGain();
-
-        // Preserve and intercept user's native volume and muted state
+        // Intercept user's native volume without Web Audio routing
         const initialVolume = typeof el.volume === "number" ? el.volume : 1.0;
-        const initialMuted = Boolean(el.muted);
 
         const trackedItem: TTrackedStream = {
           el,
           kind: classification.kind,
           id: classification.id,
-          sourceNode,
-          gainNode,
-          currentGain: 1.0,
           userVolume: initialVolume,
-          userMuted: initialMuted,
+          currentDuckedVolume: initialVolume,
         };
 
-        // Coexistence check: if GainShark or another plugin already has a gain node attached
-        const gainSharkNode = (el as any).__gainshark_gain__ || (el as any).__gain_node__;
-        if (gainSharkNode && typeof gainSharkNode.connect === "function") {
-          sourceNode.connect(gainNode);
-          gainNode.connect(gainSharkNode);
-        } else {
-          sourceNode.connect(gainNode);
-          gainNode.connect(audioCtx.destination);
-        }
-
-        // Tag nodes so other plugins (GainShark) know DuckShark is active
-        (el as any).__duckshark_gain_node__ = gainNode;
-        (el as any).__duckshark_source__ = sourceNode;
-
-        // Apply native mute to element so raw audio doesn't double-play
-        realMutedDesc?.set?.call(el, true);
-
         // Define property getters/setters on this specific element instance
-        // so Sharkord UI sliders and mute toggles continue working naturally
+        // so Sharkord UI sliders continue working naturally while DuckShark
+        // smoothly animates native hardware volume (no Web Audio resampling/artifacts).
         Object.defineProperty(el, "volume", {
           configurable: true,
           enumerable: true,
           get: () => trackedItem.userVolume,
           set: (val: number) => {
             trackedItem.userVolume = Math.max(0, Math.min(1, Number(val) || 0));
-            updateStreamGain(trackedItem);
+            updateStreamVolume(trackedItem, true);
           },
         });
 
-        Object.defineProperty(el, "muted", {
-          configurable: true,
-          enumerable: true,
-          get: () => trackedItem.userMuted,
-          set: (val: boolean) => {
-            trackedItem.userMuted = Boolean(val);
-            updateStreamGain(trackedItem);
-          },
-        });
-
-        // Set initial gain (immediate if speech is already active)
-        updateStreamGain(trackedItem, true);
+        // Set initial volume
+        updateStreamVolume(trackedItem, true);
 
         trackedItem.cleanup = () => {
+          if (trackedItem.animFrame) {
+            cancelAnimationFrame(trackedItem.animFrame);
+            trackedItem.animFrame = undefined;
+          }
           delete (el as any).volume;
-          delete (el as any).muted;
-          delete (el as any).__duckshark_gain_node__;
-          delete (el as any).__duckshark_source__;
-          realMutedDesc?.set?.call(el, trackedItem.userMuted);
           realVolumeDesc?.set?.call(el, trackedItem.userVolume);
         };
 
         trackedStreams.set(el, trackedItem);
         emitStats();
       } catch (err) {
-        console.debug("[DuckShark] Failed to attach ducking gain node to stream:", err);
+        console.debug("[DuckShark] Failed to attach native ducking to stream:", err);
       }
     }
   };
@@ -270,8 +234,6 @@ export const createDuckEngine = () => {
     const stream = trackedStreams.get(el);
     if (stream) {
       try {
-        stream.gainNode?.disconnect();
-        stream.sourceNode?.disconnect();
         stream.cleanup?.();
       } catch {}
       trackedStreams.delete(el);
@@ -393,10 +355,8 @@ export const createDuckEngine = () => {
     emitStats();
   };
 
-  const updateStreamGain = (item: TTrackedStream, immediate: boolean = false) => {
+  const updateStreamVolume = (item: TTrackedStream, immediate: boolean = false) => {
     const settings = getSettings();
-    if (!item.gainNode || !ctx) return;
-
     const shouldDuck =
       (item.kind === "stream" && settings.duckMusicStreams) ||
       (item.kind === "screen" && settings.duckScreenShares);
@@ -405,23 +365,41 @@ export const createDuckEngine = () => {
       ? Math.max(0, Math.min(1, settings.duckedVolumePercent / 100))
       : 1.0;
 
-    const baseVolume = item.userMuted ? 0 : item.userVolume;
-    const targetGain = baseVolume * duckFactor;
+    const targetVolume = item.userVolume * duckFactor;
 
-    const transitionMs = isSpeechActive ? settings.attackMs : settings.releaseMs;
-    const timeConstant = Math.max(0.01, transitionMs / 1000 / 3);
-
-    try {
-      if (immediate) {
-        item.gainNode.gain.cancelScheduledValues(ctx.currentTime);
-        item.gainNode.gain.setValueAtTime(targetGain, ctx.currentTime);
-      } else {
-        item.gainNode.gain.setTargetAtTime(targetGain, ctx.currentTime, timeConstant);
-      }
-      item.currentGain = targetGain;
-    } catch (err) {
-      console.debug("[DuckShark] Failed to update stream gain:", err);
+    if (item.animFrame) {
+      cancelAnimationFrame(item.animFrame);
+      item.animFrame = undefined;
     }
+
+    if (immediate) {
+      item.currentDuckedVolume = targetVolume;
+      realVolumeDesc?.set?.call(item.el, targetVolume);
+      return;
+    }
+
+    const startVolume = item.currentDuckedVolume;
+    const startTime = performance.now();
+    const duration = isSpeechActive ? settings.attackMs : settings.releaseMs;
+
+    const step = (now: number) => {
+      const elapsed = now - startTime;
+      const progress = Math.min(1, Math.max(0, elapsed / Math.max(1, duration)));
+      // Cosine easing for smooth, broadcast-grade crossfade without clicks
+      const ease = 0.5 - 0.5 * Math.cos(progress * Math.PI);
+      const current = startVolume + (targetVolume - startVolume) * ease;
+
+      item.currentDuckedVolume = current;
+      realVolumeDesc?.set?.call(item.el, current);
+
+      if (progress < 1) {
+        item.animFrame = requestAnimationFrame(step);
+      } else {
+        item.animFrame = undefined;
+      }
+    };
+
+    item.animFrame = requestAnimationFrame(step);
   };
 
   const applyDucking = (immediate: boolean = false) => {
@@ -430,7 +408,7 @@ export const createDuckEngine = () => {
         untrackElement(el);
         continue;
       }
-      updateStreamGain(item, immediate);
+      updateStreamVolume(item, immediate);
     }
   };
 
