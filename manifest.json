@@ -1,0 +1,10 @@
+{
+  "id": "duckshark",
+  "name": "DuckShark",
+  "author": "ImLuckyWiz",
+  "description": "Automatically ducks (lowers) music bot and stream audio while people are speaking in voice channels.",
+  "homepage": "https://github.com/ImLuckyWiz/DuckShark",
+  "logo": "https://i.imgur.com/uVBNUK9.png",
+  "sdkVersion": 2,
+  "version": "0.1.0"
+}

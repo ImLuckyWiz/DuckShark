@@ -1,0 +1,81 @@
+name: Build Plugin
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: |
+          bun install --frozen-lockfile || bun install
+
+      - name: Build plugin
+        run: |
+          bun run build
+
+      - name: Verify archive contents
+        run: |
+          echo "=== Contents of generated archive ==="
+          tar -ztvf dist/duckshark-*.tar.gz
+          echo "=== SHA-256 Checksum ==="
+          sha256sum dist/duckshark-*.tar.gz
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: duckshark-build
+          path: |
+            dist/*.tar.gz
+            dist/*.json
+            dist/duckshark/
+          retention-days: 30
+
+      - name: Publish to GitHub Release
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(node -p "require('./manifest.json').version")
+          TAG="v${VERSION}"
+          ARCHIVE="dist/duckshark-${VERSION}.tar.gz"
+          META="dist/${VERSION}.json"
+
+          cat << 'EOF' > release_notes.md
+          ### DuckShark v${VERSION}
+          - **Automatic Voice Ducking**: Smoothly attenuates music bot, stream, and screen share audio when people in voice channels are speaking.
+          - **Sharkord Plugin SDK v2**: Native integration into Sharkord User Settings (`PluginSlot.USER_SETTINGS`).
+          - **Volume & Mute Interception**: Seamlessly respects native Sharkord volume sliders and mute toggles without breaking WebRTC audio decoding.
+          - **Web Audio VAD & Store Fallback**: Fast 40ms RMS voice activity detection paired with store speaking state checks.
+          - **Microphone Self-Ducking**: Optional ducking when speaking into your own microphone via transparent WebRTC audio track taps.
+          - **GainShark Coexistence**: Detects external booster gain nodes without double-routing.
+          - **Live Engine Diagnostics**: Visual status badge and participant counters in User Settings.
+          EOF
+
+          echo "Checking release for tag $TAG..."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists. Uploading assets..."
+            gh release upload "$TAG" "$ARCHIVE" "$META" --clobber
+          else
+            echo "Creating new release $TAG..."
+            gh release create "$TAG" "$ARCHIVE" "$META" \
+              --title "DuckShark v${VERSION}" \
+              --notes-file release_notes.md
+          fi

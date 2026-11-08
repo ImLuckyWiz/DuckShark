@@ -1,0 +1,11 @@
+{
+  "name": "@sharkord/plugin-sdk",
+  "version": "0.0.30",
+  "type": "module",
+  "main": "./index.ts",
+  "types": "./index.ts",
+  "exports": {
+    ".": "./index.ts",
+    "./client": "./client.ts"
+  }
+}
