@@ -58,10 +58,10 @@ jobs:
           ARCHIVE="dist/duckshark-${VERSION}.tar.gz"
           META="dist/${VERSION}.json"
 
-          cat << 'EOF' > release_notes.md
+          cat << EOF > release_notes.md
           ### DuckShark v${VERSION}
           - **Automatic Voice Ducking**: Smoothly attenuates music bot, stream, and screen share audio when people in voice channels are speaking.
-          - **Sharkord Plugin SDK v2**: Native integration into Sharkord User Settings (`PluginSlot.USER_SETTINGS`).
+          - **Sharkord Plugin SDK v2**: Native integration into Sharkord User Settings (\`PluginSlot.USER_SETTINGS\`).
           - **Volume & Mute Interception**: Seamlessly respects native Sharkord volume sliders and mute toggles without breaking WebRTC audio decoding.
           - **Web Audio VAD & Store Fallback**: Fast 40ms RMS voice activity detection paired with store speaking state checks.
           - **Microphone Self-Ducking**: Optional ducking when speaking into your own microphone via transparent WebRTC audio track taps.
