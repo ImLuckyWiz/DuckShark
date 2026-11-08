@@ -51,31 +51,29 @@ export const createDuckEngine = () => {
   let speechHoldTimeout: ReturnType<typeof setTimeout> | undefined;
   let vadTicks = 0;
 
-  // Local microphone stream for self-ducking
-  let localStream: MediaStream | null = null;
-  let localSourceNode: MediaStreamAudioSourceNode | null = null;
-  let localAnalyser: AnalyserNode | null = null;
-  let localDataArray: Uint8Array | null = null;
-
   // Track original prototype descriptors for volume/muted
   const realVolumeDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "volume");
   const realMutedDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "muted");
-
-  // Keep references to restore WebRTC / GUM patches on stop
-  let origAddTrack: typeof RTCPeerConnection.prototype.addTrack | undefined;
-  let origGetUserMedia: typeof navigator.mediaDevices.getUserMedia | undefined;
 
   const statsListeners = new Set<(stats: TEngineStats) => void>();
 
   const getStats = (): TEngineStats => {
     const settings = getSettings();
     const isDucking = settings.enabled && isSpeechActive;
+    let isConnectedToVoice = false;
+    try {
+      const store = (window as any).__SHARKORD_STORE__;
+      const state = store?.getState?.();
+      const voice = state?.voice || state?.voiceChannel || state?.activeVoice;
+      isConnectedToVoice = Boolean(voice?.connected || voice?.channelId || voice?.currentChannelId);
+    } catch {}
+
     return {
       isDucking,
       isSpeechActive,
       trackedVoicesCount: trackedVoices.size,
       trackedStreamsCount: trackedStreams.size,
-      isLocalMicActive: Boolean(localStream && localAnalyser),
+      isLocalMicActive: Boolean(settings.duckOnSelfSpeaking && isConnectedToVoice),
       activeGainFactor: isDucking ? settings.duckedVolumePercent / 100 : 1.0,
     };
   };
@@ -132,48 +130,6 @@ export const createDuckEngine = () => {
       return { kind: "screen", id: "screen-share" };
     }
     return undefined;
-  };
-
-  /**
-   * Non-intrusively tap local microphone stream when available
-   */
-  const attachLocalMicrophone = (stream: MediaStream) => {
-    const audioTracks = stream.getAudioTracks();
-    if (!audioTracks.length) return;
-
-    if (localStream === stream && localAnalyser) return;
-
-    try {
-      const audioCtx = getAudioContext();
-      localSourceNode?.disconnect();
-      localAnalyser?.disconnect();
-
-      localStream = stream;
-      localSourceNode = audioCtx.createMediaStreamSource(stream);
-      localAnalyser = audioCtx.createAnalyser();
-      localAnalyser.fftSize = 256;
-      localSourceNode.connect(localAnalyser);
-      // NOTE: Do NOT connect localAnalyser to destination (user shouldn't hear themselves)
-      localDataArray = new Uint8Array(localAnalyser.frequencyBinCount);
-
-      // Listen for when the mic track ends
-      audioTracks[0]?.addEventListener("ended", () => {
-        if (localStream === stream) {
-          localSourceNode?.disconnect();
-          localAnalyser?.disconnect();
-          localStream = null;
-          localSourceNode = null;
-          localAnalyser = null;
-          localDataArray = null;
-          emitStats();
-        }
-      });
-
-      console.debug("[DuckShark] Tapped local microphone stream for self-ducking");
-      emitStats();
-    } catch (err) {
-      console.debug("[DuckShark] Failed to tap local microphone stream:", err);
-    }
   };
 
   const trackElement = (el: HTMLAudioElement) => {
@@ -346,8 +302,23 @@ export const createDuckEngine = () => {
 
       // Check self-speaking flag if enabled
       if (settings.duckOnSelfSpeaking) {
-        if (voice.isSpeaking === true || voice.speaking === true || voice.localSpeaking === true) {
+        if (
+          voice.isSpeaking === true ||
+          voice.speaking === true ||
+          voice.localSpeaking === true ||
+          voice.selfSpeaking === true
+        ) {
           return true;
+        }
+
+        const myUserId = state?.auth?.user?.id ?? state?.user?.id ?? voice?.userId;
+        if (myUserId) {
+          if (Array.isArray(voice.speakingUserIds) && voice.speakingUserIds.includes(myUserId)) {
+            return true;
+          }
+          if (voice.speakingUsers && voice.speakingUsers[myUserId]) {
+            return true;
+          }
         }
       }
     } catch {}
@@ -357,7 +328,7 @@ export const createDuckEngine = () => {
 
   /**
    * Voice Activity Detection loop:
-   * Inspects all active voice streams + self mic to check if someone is speaking.
+   * Inspects all active voice streams to check if someone is speaking.
    */
   const checkVAD = () => {
     const settings = getSettings();
@@ -374,7 +345,7 @@ export const createDuckEngine = () => {
 
     let speakingNow = false;
 
-    // 1. Fast check: Sharkord store speaking indicators
+    // 1. Fast check: Sharkord store speaking indicators (handles remote + local speaking without hijacking mic)
     if (checkStoreSpeaking()) {
       speakingNow = true;
     }
@@ -400,21 +371,6 @@ export const createDuckEngine = () => {
           speakingNow = true;
           break;
         }
-      }
-    }
-
-    // 3. Web Audio RMS check for local microphone (if self-ducking enabled)
-    if (!speakingNow && settings.duckOnSelfSpeaking && localAnalyser && localDataArray) {
-      localAnalyser.getByteTimeDomainData(localDataArray);
-      let sum = 0;
-      for (let i = 0; i < localDataArray.length; i++) {
-        const val = (localDataArray[i]! - 128) / 128;
-        sum += val * val;
-      }
-      const rms = Math.sqrt(sum / localDataArray.length);
-
-      if (rms > settings.vadThreshold) {
-        speakingNow = true;
       }
     }
 
@@ -487,64 +443,9 @@ export const createDuckEngine = () => {
     audioElements.forEach(trackElement);
   };
 
-  const hookMicrophone = () => {
-    // 1. Hook RTCPeerConnection.prototype.addTrack
-    if (typeof RTCPeerConnection !== "undefined" && RTCPeerConnection.prototype.addTrack) {
-      origAddTrack = RTCPeerConnection.prototype.addTrack;
-      RTCPeerConnection.prototype.addTrack = function (
-        track: MediaStreamTrack,
-        ...streams: MediaStream[]
-      ) {
-        if (track.kind === "audio") {
-          const micStream = streams[0] || new MediaStream([track]);
-          attachLocalMicrophone(micStream);
-        }
-        return origAddTrack!.apply(this, [track, ...streams] as any);
-      };
-    }
-
-    // 2. Hook navigator.mediaDevices.getUserMedia
-    if (navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === "function") {
-      origGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
-      navigator.mediaDevices.getUserMedia = async function (constraints) {
-        const stream = await origGetUserMedia!(constraints);
-        if (
-          constraints &&
-          (constraints === true || (typeof constraints === "object" && constraints.audio))
-        ) {
-          attachLocalMicrophone(stream);
-        }
-        return stream;
-      };
-    }
-  };
-
-  const unhookMicrophone = () => {
-    if (origAddTrack && typeof RTCPeerConnection !== "undefined") {
-      RTCPeerConnection.prototype.addTrack = origAddTrack;
-      origAddTrack = undefined;
-    }
-    if (origGetUserMedia && navigator.mediaDevices) {
-      navigator.mediaDevices.getUserMedia = origGetUserMedia;
-      origGetUserMedia = undefined;
-    }
-
-    try {
-      localSourceNode?.disconnect();
-      localAnalyser?.disconnect();
-    } catch {}
-
-    localStream = null;
-    localSourceNode = null;
-    localAnalyser = null;
-    localDataArray = null;
-  };
-
   const start = () => {
     window.addEventListener("pointerdown", resumeOnGesture, true);
     window.addEventListener("keydown", resumeOnGesture, true);
-
-    hookMicrophone();
 
     observer = new MutationObserver(() => scan());
     observer.observe(document.body, {
@@ -568,8 +469,6 @@ export const createDuckEngine = () => {
   const stop = () => {
     window.removeEventListener("pointerdown", resumeOnGesture, true);
     window.removeEventListener("keydown", resumeOnGesture, true);
-
-    unhookMicrophone();
 
     observer?.disconnect();
     observer = undefined;
