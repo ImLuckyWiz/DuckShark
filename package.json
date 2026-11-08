@@ -1,6 +1,6 @@
 {
   "name": "duckshark",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "ImLuckyWiz",
   "module": "src/server/index.ts",
   "type": "module",
