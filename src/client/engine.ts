@@ -61,11 +61,13 @@ export const createDuckEngine = () => {
     const settings = getSettings();
     const isDucking = settings.enabled && isSpeechActive;
     let isConnectedToVoice = false;
+    let isMicMuted = false;
+
     try {
       const store = (window as any).__SHARKORD_STORE__;
       const state = store?.getState?.();
-      const voice = state?.voice || state?.voiceChannel || state?.activeVoice;
-      isConnectedToVoice = Boolean(voice?.connected || voice?.channelId || voice?.currentChannelId);
+      isConnectedToVoice = Boolean(state?.currentVoiceChannelId);
+      isMicMuted = Boolean(state?.ownVoiceState?.micMuted);
     } catch {}
 
     return {
@@ -73,7 +75,7 @@ export const createDuckEngine = () => {
       isSpeechActive,
       trackedVoicesCount: trackedVoices.size,
       trackedStreamsCount: trackedStreams.size,
-      isLocalMicActive: Boolean(settings.duckOnSelfSpeaking && isConnectedToVoice),
+      isLocalMicActive: Boolean(settings.duckOnSelfSpeaking && isConnectedToVoice && !isMicMuted),
       activeGainFactor: isDucking ? settings.duckedVolumePercent / 100 : 1.0,
     };
   };
@@ -278,50 +280,42 @@ export const createDuckEngine = () => {
   };
 
   /**
-   * Inspects Sharkord native store state as a zero-CPU speaking check fallback
+   * Inspects Sharkord DOM speaking indicators.
+   *
+   * Sharkord's useAudioLevel & useSpeakingState hooks dynamically assign
+   * .speaking-effect-low, .speaking-effect-medium, or .speaking-effect-high
+   * to voice user cards and sidebar avatars whenever speech is detected
+   * (including the local user when unmuted, and remote participants).
+   *
+   * This non-intrusive DOM inspection delivers instant, zero-CPU speech detection
+   * without hijacking or monkey-patching navigator.mediaDevices.getUserMedia.
    */
-  const checkStoreSpeaking = (): boolean => {
+  const checkSpeaking = (): boolean => {
+    const settings = getSettings();
     const store = (window as any).__SHARKORD_STORE__;
-    if (!store || typeof store.getState !== "function") return false;
+    const state = store && typeof store.getState === "function" ? store.getState() : undefined;
 
-    try {
-      const state = store.getState();
-      const settings = getSettings();
-      const voice = state?.voice || state?.voiceChannel || state?.activeVoice;
-      if (!voice) return false;
+    const inVoice = Boolean(state?.currentVoiceChannelId);
+    const micMuted = Boolean(state?.ownVoiceState?.micMuted);
 
-      // Check remote speaking flags
-      if (Array.isArray(voice.speakingUserIds) && voice.speakingUserIds.length > 0) {
-        return true;
-      }
-      if (voice.speakingUsers && typeof voice.speakingUsers === "object") {
-        for (const speaking of Object.values(voice.speakingUsers)) {
-          if (speaking) return true;
-        }
-      }
+    // Only evaluate voice activity if connected to a voice channel
+    if (inVoice) {
+      const speakingEl = document.querySelector(
+        ".speaking-effect-low, .speaking-effect-medium, .speaking-effect-high, [class*='speaking-effect-']"
+      );
 
-      // Check self-speaking flag if enabled
-      if (settings.duckOnSelfSpeaking) {
-        if (
-          voice.isSpeaking === true ||
-          voice.speaking === true ||
-          voice.localSpeaking === true ||
-          voice.selfSpeaking === true
-        ) {
+      if (speakingEl) {
+        // If duckOnSelfSpeaking is enabled and user is not muted, duck!
+        if (settings.duckOnSelfSpeaking && !micMuted) {
           return true;
         }
 
-        const myUserId = state?.auth?.user?.id ?? state?.user?.id ?? voice?.userId;
-        if (myUserId) {
-          if (Array.isArray(voice.speakingUserIds) && voice.speakingUserIds.includes(myUserId)) {
-            return true;
-          }
-          if (voice.speakingUsers && voice.speakingUsers[myUserId]) {
-            return true;
-          }
+        // If duckOnSelfSpeaking is disabled, only duck if remote participants are speaking
+        if (!settings.duckOnSelfSpeaking && trackedVoices.size > 0) {
+          return true;
         }
       }
-    } catch {}
+    }
 
     return false;
   };
@@ -345,8 +339,8 @@ export const createDuckEngine = () => {
 
     let speakingNow = false;
 
-    // 1. Fast check: Sharkord store speaking indicators (handles remote + local speaking without hijacking mic)
-    if (checkStoreSpeaking()) {
+    // 1. Sharkord DOM indicator check (handles local user + remote users)
+    if (checkSpeaking()) {
       speakingNow = true;
     }
 
@@ -392,7 +386,9 @@ export const createDuckEngine = () => {
   };
 
   const setSpeechActive = (active: boolean) => {
+    if (isSpeechActive === active) return;
     isSpeechActive = active;
+    console.log(`[DuckShark] Voice activity ${active ? "detected (ducking audio)" : "ended (restoring audio)"}`);
     applyDucking();
     emitStats();
   };

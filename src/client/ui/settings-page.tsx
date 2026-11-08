@@ -107,8 +107,17 @@ export const SettingsPage = memo(() => {
             }}
           >
             <span>
-              Voice Participants: <strong style={{ color: "var(--foreground, #eee)" }}>{stats.trackedVoicesCount}</strong>
-              {stats.isLocalMicActive ? " (+ Mic active)" : ""}
+              Voice Participants:{" "}
+              <strong style={{ color: "var(--foreground, #eee)" }}>
+                {stats.trackedVoicesCount + (stats.isLocalMicActive ? 1 : 0)}
+              </strong>
+              {stats.isLocalMicActive
+                ? stats.trackedVoicesCount > 0
+                  ? ` (You + ${stats.trackedVoicesCount} remote)`
+                  : " (You · Mic active)"
+                : stats.trackedVoicesCount > 0
+                  ? " (Remote only)"
+                  : ""}
             </span>
             <span>•</span>
             <span>
